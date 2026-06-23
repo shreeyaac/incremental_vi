@@ -1,0 +1,34 @@
+// Simple 6-state MDP for incremental VI testing
+// States: 0=init, 1, 2, 3, 4, 5=goal
+// Action removal test: remove action "a1" at state 1
+// This changes reachability for states 0,1 but not 4,5
+
+mdp
+
+module test_mdp
+
+    s : [0..5] init 0;
+
+    // State 0: two actions leading to state 1 or state 4
+    [a0] s=0 -> 0.7:(s'=1) + 0.3:(s'=2);
+    [a1] s=0 -> 1.0:(s'=4);
+
+    // State 1: two actions
+    [a0] s=1 -> 0.5:(s'=2) + 0.5:(s'=3);
+    [a1] s=1 -> 1.0:(s'=5);   // <-- removing this action changes values at 0,1
+
+    // State 2: one action, leads to goal with low prob
+    [a0] s=2 -> 0.1:(s'=5) + 0.9:(s'=2);
+
+    // State 3: one action, deadend (no path to goal)
+    [a0] s=3 -> 1.0:(s'=3);
+
+    // State 4: one action, leads to goal
+    [a0] s=4 -> 1.0:(s'=5);
+
+    // State 5: goal (absorbing)
+    [a0] s=5 -> 1.0:(s'=5);
+
+endmodule
+
+label "goal" = s=5;

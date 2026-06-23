@@ -1,0 +1,13 @@
+build/
+*.so
+*.o
+*.a
+*.dylib
+__pycache__/
+*.pyc
+*.egg-info/
+.venv/
+venv/
+reports/
+.DS_Store
+.vscode/

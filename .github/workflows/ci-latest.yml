@@ -1,0 +1,110 @@
+name: CI (latest)
+# Builds and tests paynt and deploys images to Dockerhub
+
+on:
+  push:
+    branches:
+      - master
+  schedule:
+    # run weekly
+    - cron: '0 8 * * 1,3,5'
+  # needed to trigger the workflow manually
+  workflow_dispatch:
+  pull_request:
+
+env:
+  # GitHub runners currently have 4 cores
+  NR_JOBS: "4"
+
+jobs:
+
+  latestTests:
+    name: Test on latest (${{ matrix.build_type.name }})
+    runs-on: ubuntu-latest
+    continue-on-error: true
+    strategy:
+      matrix:
+        build_type:
+          - {name: "Debug",
+             stormpy_base: "ci-debug",
+             docker_tag: "ci-debug",
+             build_type: "Debug",
+             setup_args: "",
+             optional_libs: "[test]"
+          }
+          - {name: "Release",
+             stormpy_base: "ci",
+             docker_tag: "ci",
+             build_type: "Release",
+             setup_args: "",
+             optional_libs: "[test]"
+          }
+      fail-fast: false
+
+    steps:
+      - name: Git clone
+        uses: actions/checkout@v6
+      - name: Build paynt image from Dockerfile
+        run: |
+          docker build -t randriu/paynt:${{ matrix.build_type.docker_tag }} . \
+            --build-arg BASE_IMAGE=movesrwth/stormpy:${{ matrix.build_type.stormpy_base }} \
+            --build-arg build_type=${{ matrix.build_type.build_type }} \
+            --build-arg no_threads=${NR_JOBS}
+      - name: Run Docker
+        run: docker run -d -it --name ci randriu/paynt:${{ matrix.build_type.docker_tag }}
+      - name: Run PAYNT tests
+        run: docker exec ci bash -c "cd /opt/paynt; pytest tests"
+      - name: Run Payntbind tests
+        run: docker exec ci bash -c "cd /opt/paynt/payntbind; pytest tests"
+
+
+
+
+  deploy:
+    name: Test and Deploy on latest (${{ matrix.build_type.name }})
+    runs-on: ubuntu-latest
+    strategy:
+      matrix:
+        build_type:
+          - {name: "Debug",
+             docker_tag: "ci-debug",
+             stormpy_base: "ci-debug",
+             build_type: "Debug",
+             setup_args: "",
+             optional_libs: "[test]"
+          }
+          - {name: "Release",
+             docker_tag: "ci",
+             stormpy_base: "ci",
+             build_type: "Release",
+             setup_args: "",
+             optional_libs: "[test]"
+          }
+      fail-fast: false
+    steps:
+      - name: Git clone
+        uses: actions/checkout@v6
+      - name: Build paynt image from Dockerfile
+        run: |
+          docker build -t randriu/paynt:${{ matrix.build_type.docker_tag }} . \
+            --build-arg BASE_IMAGE=movesrwth/stormpy:${{ matrix.build_type.stormpy_base }} \
+            --build-arg build_type=${{ matrix.build_type.build_type }} \
+            --build-arg setup_args="${{ matrix.build_type.setup_args }}" \
+            --build-arg options=${{ matrix.build_type.optional_libs }} \
+            --build-arg no_threads=${NR_JOBS}
+      - name: Run Docker
+        run: docker run -d -it --name ci randriu/paynt:${{ matrix.build_type.docker_tag }}
+      - name: Run PAYNT tests
+        run: docker exec ci bash -c "cd /opt/paynt; pytest tests"
+      - name: Run Payntbind tests
+        run: docker exec ci bash -c "cd /opt/paynt/payntbind; pytest tests"
+
+      - name: Login into docker
+        # Only login if using master on original repo (and not for pull requests or forks)
+        if: github.repository_owner == 'randriu' && github.ref == 'refs/heads/master'
+        run: echo '${{ secrets.STORMPY_CI_DOCKER_PASSWORD }}' | docker login -u randriu --password-stdin
+      - name: Deploy paynt image
+        # Only deploy if using master on original repo (and not for pull requests or forks)
+        if: github.repository_owner == 'randriu' && github.ref == 'refs/heads/master'
+        run: docker push randriu/paynt:${{ matrix.build_type.docker_tag }}
+

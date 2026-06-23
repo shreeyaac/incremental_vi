@@ -1,0 +1,35 @@
+// Reconstruction of Fig.1 / Table 2 from the paper (undershooting section).
+// Removing optimal action "a" at state q. Cone of influence = {p, q}.
+//
+// Expected (original):   V_M(p)=0.7,  V_M(q)=0.9
+// Expected (modified):   V_M'(p)=0.4, V_M'(q)=0.3
+// Smart undershoot with eps=0.2 should reach this in 3 rounds (Table 2).
+//
+// Auxiliary states c09/c05/c02 reach the goal with prob 0.9/0.5/0.2 and are
+// outside the cone of influence.
+
+mdp
+
+module fig1
+    s : [0..7] init 1;   // 0=p, 1=q, 2=c09, 3=c05, 4=c02, 5=goal, 6=sink
+
+    // state 0 = p : single action, 0.5 -> q, 0.5 -> c05 (value 0.5)
+    [bp]  s=0 -> 0.5:(s'=1) + 0.5:(s'=3);
+
+    // state 1 = q : action a (optimal, removed) -> c09 ; action b -> 0.5 c02 + 0.5 p
+    [a]   s=1 -> 1.0:(s'=2);
+    [b]   s=1 -> 0.5:(s'=4) + 0.5:(s'=0);
+
+    // value-0.9 state
+    [g]   s=2 -> 0.9:(s'=5) + 0.1:(s'=6);
+    // value-0.5 state
+    [g]   s=3 -> 0.5:(s'=5) + 0.5:(s'=6);
+    // value-0.2 state
+    [g]   s=4 -> 0.2:(s'=5) + 0.8:(s'=6);
+
+    // goal (absorbing) and sink (absorbing zero)
+    [g]   s=5 -> 1.0:(s'=5);
+    [g]   s=6 -> 1.0:(s'=6);
+endmodule
+
+label "goal" = s=5;

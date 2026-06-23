@@ -1,0 +1,331 @@
+name: Build wheels
+
+on:
+  schedule:
+    # run weekly
+    - cron: '0 10 * * 3'
+  workflow_call:
+    inputs:
+      nightly:
+        description: 'Build nightly/dev wheels (use stormpy nightly)'
+        required: true
+        default: false
+        type: boolean
+  # needed to trigger the workflow manually
+  workflow_dispatch:
+    inputs:
+      nightly:
+        description: 'Build nightly/dev wheels (use stormpy nightly)'
+        required: true
+        default: false
+        type: boolean
+
+jobs:
+  get_storm_version:
+    name: Install stormpy and get storm version
+    runs-on: ubuntu-latest
+    outputs:
+      storm_repository: ${{ steps.get_versions.outputs.storm_repository }}
+      storm_tag: ${{ steps.get_versions.outputs.storm_tag }}
+      storm_commit_hash: ${{ steps.get_versions.outputs.storm_commit_hash }}
+      stormpy_version: ${{ steps.get_versions.outputs.stormpy_version }}
+    steps:
+      - name: Set NIGHTLY_BUILD flag
+        run: |
+          if [[ "${{ github.event_name }}" == "schedule" ]] || [[ "${{ inputs.nightly }}" == true ]]; then
+            echo "NIGHTLY_BUILD=true" >> $GITHUB_ENV
+          else
+            echo "NIGHTLY_BUILD=false" >> $GITHUB_ENV
+          fi
+      - name: Set STORMPY_ARTIFACT_NAME
+        if: env.NIGHTLY_BUILD == 'true'
+        run: |
+          echo "STORMPY_ARTIFACT_NAME=stormpy-wheels-linux-intel" >> $GITHUB_ENV
+      - name: Download stormpy nightly wheel if NIGHTLY_BUILD
+        if: env.NIGHTLY_BUILD == 'true'
+        uses: dawidd6/action-download-artifact@v21
+        with:
+          github_token: ${{ secrets.GITHUB_TOKEN }}
+          workflow: create_wheel_scheduled.yml
+          repo: stormchecker/stormpy
+          name: ${{ env.STORMPY_ARTIFACT_NAME }}
+          path: stormpy_wheels/
+      - name: Install stormpy
+        id: get_versions
+        run: |
+          docker run -i --rm -v ./stormpy_wheels:/stormpy_wheels ubuntu:latest /bin/bash << 'EOF'
+          set -euo pipefail
+          set -x
+
+          apt update && DEBIAN_FRONTEND=noninteractive TZ=Etc/UTC apt install -y python3 python3-pip python3-venv python3-dev
+
+          # Get major+minor version (e.g. "311" for Python 3.11)
+          PY_VER=$(python3 -c "import sys; print(f'{sys.version_info.major}{sys.version_info.minor}')")
+          echo "Python version: $PY_VER"
+
+          if ${{ env.NIGHTLY_BUILD }}; then
+            WHEEL_DIR="stormpy_wheels"
+            WHEEL=$(ls "$WHEEL_DIR"/*-cp${PY_VER}-cp${PY_VER}-*.whl 2>/dev/null | head -n 1 || true)
+            if [[ -z "${WHEEL:-}" ]]; then
+              echo "No stormpy wheel found in stormpy_wheels/" >&2
+              ls -la stormpy_wheels/ >&2 || true
+              exit 1
+            fi
+            python3 -m venv venv
+            source venv/bin/activate
+            python3 -m pip install --force-reinstall "$WHEEL"
+          else
+            python3 -m venv venv
+            source venv/bin/activate
+            python3 -m pip install stormpy
+          fi
+
+          read -r storm_repository storm_tag storm_commit_hash < <( \
+            python3 -c "import stormpy.info; print(*stormpy.info.storm_origin_info())" \
+          )
+          stormpy_version=$(python3 -c "import stormpy; print(stormpy.__version__)")
+
+          # Write results to a file in the mounted directory
+          {
+            echo "storm_repository=$storm_repository"
+            echo "storm_tag=$storm_tag"
+            echo "storm_commit_hash=$storm_commit_hash"
+            echo "stormpy_version=$stormpy_version"
+          } > /stormpy_wheels/versions.env
+          EOF
+
+          # Export container results as step outputs (host environment)
+          cat stormpy_wheels/versions.env
+          while IFS='=' read -r k v; do
+            echo "$k=$v" >> "$GITHUB_OUTPUT"
+          done < stormpy_wheels/versions.env
+
+  build_wheels:
+    name: Build wheels for ${{ matrix.os }}
+    needs: get_storm_version
+    runs-on: ${{ matrix.runs-on }}
+    strategy:
+      matrix:
+        os: [ linux-intel, linux-arm, macos-intel, macos-arm ]
+        include:
+          # Set defaults
+          - archs: auto
+            platform: auto
+            xcode: ""
+            deploy_target: 13.0
+          - os: linux-intel
+            runs-on: ubuntu-latest
+            archs: x86_64
+          - os: linux-arm
+            runs-on: ubuntu-24.04-arm
+            archs: aarch64
+          - os: macos-intel
+            runs-on: macos-15-intel # x86_64 runner
+            xcode: latest-stable
+            deploy_target: 15.0
+          - os: macos-arm
+            runs-on: macos-15 # macos-15+ (including latest) are ARM64 runners
+            xcode: latest-stable
+            deploy_target: 15.0
+      fail-fast: false
+    steps:
+      - name: Set NIGHTLY_BUILD flag
+        run: |
+          if [[ "${{ github.event_name }}" == "schedule" ]] || [[ "${{ inputs.nightly }}" == true ]]; then
+            echo "NIGHTLY_BUILD=true" >> $GITHUB_ENV
+          else
+            echo "NIGHTLY_BUILD=false" >> $GITHUB_ENV
+          fi
+      - uses: actions/checkout@v6
+      - uses: maxim-lobanov/setup-xcode@v1
+        if: ${{ matrix.xcode != '' }}
+        with:
+          xcode-version: ${{ matrix.xcode }}
+      - name: Prepare nightly version
+        if: env.NIGHTLY_BUILD == 'true'
+        run: | 
+          perl -i -pe 's/__version__ = "(\d+)\.(\d+)\.(\d+)"/"__version__ = \"$1.$2.".($3+1).".dev1\""/e' paynt/_version.py
+          perl -i -pe 's/__version__ = "(\d+)\.(\d+)\.(\d+)"/"__version__ = \"$1.$2.".($3+1).".dev1\""/e' payntbind/lib/payntbind/_version.py
+      - name: Prepare storm version
+        run: |
+          python3 - <<'PY'
+          import re
+          from pathlib import Path
+
+          p = Path("pyproject.toml")
+          s = p.read_text()
+
+          s = re.sub(r'STORM_GIT_REPO="[^"]*"', 'STORM_GIT_REPO="${{ needs.get_storm_version.outputs.storm_repository }}"', s)
+          s = re.sub(r'STORM_GIT_TAG="[^"]*"',  'STORM_GIT_TAG="${{ needs.get_storm_version.outputs.storm_commit_hash }}"', s)
+
+          p.write_text(s)
+          PY
+      - name: Build wheels
+        uses: pypa/cibuildwheel@v3.4.1
+        env:
+          CIBW_PLATFORM: ${{ matrix.platform }}
+          CIBW_ARCHS: ${{ matrix.archs }}
+          MACOSX_DEPLOYMENT_TARGET: ${{ matrix.deploy_target }}
+          CIBW_ENVIRONMENT: NR_JOBS=4 STORM_REPOSITORY=${{ needs.get_storm_version.outputs.storm_repository }} STORM_TAG=${{ needs.get_storm_version.outputs.storm_tag }} STORM_COMMIT_HASH=${{ needs.get_storm_version.outputs.storm_commit_hash }} STORMPY_VERSION=${{ needs.get_storm_version.outputs.stormpy_version }}
+      - uses: actions/upload-artifact@v7
+        with:
+          name: paynt-wheels-${{ matrix.os }}
+          path: ./wheelhouse/*.whl
+
+
+  build_sdist:
+    name: Build source distribution
+    runs-on: ubuntu-latest
+    steps:
+      - name: Set NIGHTLY_BUILD flag
+        run: |
+          if [[ "${{ github.event_name }}" == "schedule" ]] || [[ "${{ inputs.nightly }}" == true ]]; then
+            echo "NIGHTLY_BUILD=true" >> $GITHUB_ENV
+          else
+            echo "NIGHTLY_BUILD=false" >> $GITHUB_ENV
+          fi
+      - uses: actions/checkout@v6
+      - name: Prepare nightly version
+        if: env.NIGHTLY_BUILD == 'true'
+        run: | 
+          perl -i -pe 's/__version__ = "(\d+)\.(\d+)\.(\d+)"/"__version__ = \"$1.$2.".($3+1).".dev1\""/e' paynt/_version.py
+          perl -i -pe 's/__version__ = "(\d+)\.(\d+)\.(\d+)"/"__version__ = \"$1.$2.".($3+1).".dev1\""/e' payntbind/lib/payntbind/_version.py
+      - name: Build sdist
+        run: pipx run build --sdist
+      - uses: actions/upload-artifact@v7
+        with:
+          name: paynt-sdist
+          path: dist/*.tar.gz
+
+
+  test_wheels_linux:
+    name: Test wheel on ${{ matrix.distro }} and ${{ matrix.arch.name }}
+    needs: [build_wheels]
+    runs-on: ${{ matrix.arch.runner }}
+    strategy:
+      fail-fast: false
+      matrix:
+        arch:
+          - {name: linux-intel,
+             runner: ubuntu-latest
+          }
+          - {name: linux-arm,
+             runner: ubuntu-24.04-arm
+          }
+        distro:
+          - ubuntu:latest
+          - ubuntu:rolling
+          - debian:latest
+          - fedora:latest
+          - archlinux:latest
+        exclude:
+          - arch: {name: linux-arm, runner: ubuntu-24.04-arm}
+            distro: archlinux:latest
+    steps:
+      - uses: actions/download-artifact@v8
+        with:
+          pattern: paynt-wheels-${{ matrix.arch.name }}
+          path: dist
+          merge-multiple: true
+      - name: Checkout test files
+        uses: actions/checkout@v6
+        with:
+          path: dist/test_files
+          sparse-checkout: |
+            tests
+      - name: Install from wheel and test
+        # TODO run tests
+        run: |
+          docker run -i --rm -v ./dist:/wheel ${{ matrix.distro }} /bin/bash << 'EOF'
+          set -euo pipefail
+          set -x
+
+          cd /wheel
+
+          # Install Python & pip (varies per distro)
+          if command -v apt; then
+            apt update && DEBIAN_FRONTEND=noninteractive TZ=Etc/UTC apt install -y python3 python3-pip python3-venv python3-dev
+          elif command -v dnf; then
+            dnf install -y python3 python3-pip python3-devel
+          elif command -v pacman; then
+            pacman -Syu --noconfirm python python-pip
+          fi
+
+          # Get major+minor version (e.g. "311" for Python 3.11)
+          PY_VER=$(python3 -c "import sys; print(f'{sys.version_info.major}{sys.version_info.minor}')")
+          echo "Python version: $PY_VER"
+
+          # Look for a matching wheel in the current directory
+          WHEEL=$(ls paynt-*-cp${PY_VER}-*.whl 2>/dev/null | head -n1 || true)
+          echo "Found wheel: $WHEEL"
+          if [ -z "$WHEEL" ]; then
+            echo "Error: No paynt wheel found for Python ${PY_VER:0:1}.${PY_VER:1}." >&2
+            exit 1
+          fi
+
+          echo "Installing $WHEEL..."
+          python3 -m venv venv
+          source venv/bin/activate
+          python3 -m pip install "$WHEEL"
+
+          # Run a basic import test (replace with pytest if needed)
+          python3 -c "import paynt; import payntbind; print('Import successful')"
+          EOF
+
+
+  test_wheels_mac:
+    name: Test wheel on ${{ matrix.distro.name }}
+    needs: [build_wheels]
+    runs-on: ${{ matrix.distro.distro }}
+    strategy:
+      fail-fast: false
+      matrix:
+        distro:
+          - {name: "XCode Latest, ARM",
+             os: macos-arm,
+             distro: "macos-15",
+             xcode: "latest-stable"
+          }
+          - {name: "XCode Latest, Intel",
+             os: macos-intel,
+             distro: "macos-15-intel",
+             xcode: "latest-stable"
+          }
+    steps:
+      - uses: maxim-lobanov/setup-xcode@v1
+        with:
+          xcode-version: ${{ matrix.distro.xcode }}
+      - uses: actions/download-artifact@v8
+        with:
+          pattern: paynt-wheels-${{ matrix.distro.os }}
+          path: dist
+          merge-multiple: true
+      - name: Install from wheel and test
+        working-directory: dist
+        run: |
+          # Get major+minor version (e.g. "311" for Python 3.11)
+          PY_VER=$(python3 -c "import sys; print(f'{sys.version_info.major}{sys.version_info.minor}')")
+          echo "Python version: $PY_VER"
+          # Look for a matching wheel in the current directory
+          WHEEL=$(ls paynt-*-cp${PY_VER}-*.whl 2>/dev/null | head -n1 || true)
+          echo "Found wheel: $WHEEL"
+          if [ -z "$WHEEL" ]; then
+            echo "Error: No paynt wheel found for Python ${PY_VER:0:1}.${PY_VER:1}." >&2
+            exit 1
+          fi
+          echo "Installing $WHEEL..."
+          python3 -m venv venv
+          source venv/bin/activate
+          python3 -m pip install "$WHEEL"
+      - name: Checkout test files
+        uses: actions/checkout@v6
+        with:
+          path: dist/test_files
+          sparse-checkout: |
+            tests
+      - name: Test
+        # TODO run tests
+        working-directory: dist
+        run: |
+          source venv/bin/activate
+          python3 -c "import paynt; import payntbind; print('Import successful')"
