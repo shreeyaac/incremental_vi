@@ -1,0 +1,46 @@
+# Reproducible container for the incremental-VI / cone-of-influence experiments.
+#
+# It packages the whole stack so it runs on a sudo-less server:
+#   Storm + stormpy   -> from the pinned movesrwth/stormpy:1.13.0 base image
+#   payntbind (C++)   -> compiled during the build
+#   PAYNT + our code  -> installed / copied in (incremental_vi/, run_*.py, ...)
+#
+# Base is PINNED to 1.13.0 (the version all our results were validated against);
+# do NOT use :ci, which is a rolling tag and will drift.
+#
+# Build (on the server, native x86 — fast; locally on Apple Silicon it runs
+# under emulation and is slow):
+#   docker build -f Dockerfile.experiments -t incremental-vi:1.0 .
+#
+# Run an experiment (mount a host dir to get results out):
+#   docker run --rm -v "$PWD/out:/opt/paynt/out" incremental-vi:1.0 \
+#       python run_benchmarks.py --all-small \
+#         --glob "models/archive/cav23-saynt/*/sketch.templ" --num-removals 40
+#
+#   docker run --rm incremental-vi:1.0 \
+#       python coi_table.py models/archive/cav23-saynt/refuel-06 --num 8
+#
+#   docker run --rm incremental-vi:1.0 \
+#       python reproduce_eidar.py models/archive/cav23-saynt/drone-4-1 600
+#
+# Interactive shell:
+#   docker run --rm -it incremental-vi:1.0 bash
+
+ARG BASE_IMAGE=movesrwth/stormpy:1.13.0
+FROM ${BASE_IMAGE}
+
+ARG no_threads=4
+
+# PAYNT runtime/build dependencies
+RUN apt-get update -qq && apt-get install -y graphviz && rm -rf /var/lib/apt/lists/*
+
+WORKDIR /opt/paynt
+COPY . .
+
+# build payntbind (C++) against the pinned Storm and install PAYNT + deps
+RUN pip install -r build-requirements.txt
+RUN pip install . --no-build-isolation
+
+# our experiment scripts live at the repo root and are run directly:
+#   run_experiments.py, run_benchmarks.py, coi_table.py, reproduce_eidar.py
+CMD ["bash"]
