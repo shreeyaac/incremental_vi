@@ -205,8 +205,15 @@ def get_best_actions(model, V: list, delta: float = 0.0,
                 vals.append(sum(entry.value() * V[entry.column]
                                 for entry in matrix.get_row(row_idx)))
         best_val = max(v for v in vals if v >= 0)
-        best[state] = {i for i, v in enumerate(vals)
-                       if v >= 0 and v >= best_val - delta}
+        # When delta == 0 keep only exact maxima; avoid `best_val - delta`,
+        # which fails for exact (rational) values minus a float 0.0.
+        if delta == 0:
+            best[state] = {i for i, v in enumerate(vals)
+                           if v >= 0 and v >= best_val}
+        else:
+            threshold = best_val - delta
+            best[state] = {i for i, v in enumerate(vals)
+                           if v >= 0 and v >= threshold}
     return best
 
 

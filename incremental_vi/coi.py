@@ -156,14 +156,18 @@ def _propagate_cone(model, cone, backward_trans, target_states,
 
 def coi_exact(model, hat_s: int, hat_a: int, V: list,
               backward_trans: dict, target_states: set,
-              delta: float = 0.0, mec_map: dict = None) -> set:
+              delta: float = 0.0, mec_map: dict = None, tol=None) -> set:
     """
     Compute exact COI (Algorithm 1), EC-aware. A predecessor p enters the cone
     iff ALL best exits of MEC(p) have a successor in the current cone.
+
+    tol: best-action tie tolerance. Defaults to _EXACT_EPS (absorbs float
+    solver noise). Pass tol=0 when V is EXACT (rational) -- then ties are
+    decided exactly and Algorithm 1 is theoretically sound.
     """
     if mec_map is None:
         mec_map = compute_mec_map(model)
-    best_actions = get_best_actions(model, V, delta=_EXACT_EPS)
+    best_actions = get_best_actions(model, V, delta=(_EXACT_EPS if tol is None else tol))
 
     cone, abort = _initial_cone(model, hat_s, hat_a, best_actions, mec_map,
                                 exact=True)
@@ -179,15 +183,18 @@ def coi_exact(model, hat_s: int, hat_a: int, V: list,
 
 def coi_approx(model, hat_s: int, hat_a: int, V: list,
                backward_trans: dict, target_states: set,
-               delta: float = 0.0, mec_map: dict = None) -> set:
+               delta: float = 0.0, mec_map: dict = None, tol=None) -> set:
     """
     Compute approximate COI (Algorithm 2), EC-aware. A predecessor p enters the
     cone iff ANY best exit of MEC(p) (best actions within +/-delta of optimal)
     has a successor in the current cone.
+
+    tol: base tie tolerance (default _EXACT_EPS; pass 0 for exact V).
     """
     if mec_map is None:
         mec_map = compute_mec_map(model)
-    best_actions = get_best_actions(model, V, delta=max(delta, _EXACT_EPS))
+    base_tol = _EXACT_EPS if tol is None else tol
+    best_actions = get_best_actions(model, V, delta=max(delta, base_tol))
 
     cone, abort = _initial_cone(model, hat_s, hat_a, best_actions, mec_map,
                                 exact=False)

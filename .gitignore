@@ -1,13 +1,14 @@
-build/
-*.so
-*.o
-*.a
-*.dylib
 __pycache__/
-*.pyc
 *.egg-info/
-.venv/
+
+prerequisites/
+
 venv/
-reports/
+
+.vscode
+.idea
+
+# OSX
 .DS_Store
-.vscode/
+
+build/

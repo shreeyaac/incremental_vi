@@ -1,0 +1,33 @@
+// Small demo for visualizing the cone of influence (max reachability to goal).
+// Removing the optimal action at the modified state shows Algorithm 2 (approx)
+// over-approximating Algorithm 1 (exact). All states are reachable from init.
+//
+//   goal = 8 (V=1), sink = 6 (V=0)
+//   init 0 -> {1, 3}  (so both the s-hat region and the tie state are reachable)
+//   state 1 = s-hat:  action a (optimal) -> 2 (V 0.9);  action b -> 7 (V 0.5)
+//                     removing a drops V(1): 0.9 -> 0.5, and that propagates to 0
+//   state 3 has a TIE: action x -> 1 (into cone); action y -> 4 (V 0.9, outside)
+//                     after removal it just uses y, so V(3) is UNCHANGED
+//       * exact (Alg 1): NOT all best exits of 3 lead into the cone -> 3 excluded (correct)
+//       * approx (Alg 2): SOME best exit of 3 leads into the cone -> 3 included (false positive)
+//
+// Expected: value actually changed = {0,1};  exact cone = {0,1};  approx cone = {0,1,3}.
+
+mdp
+
+module m
+    s : [0..8] init 0;
+
+    [start] s=0 -> 0.5:(s'=1) + 0.5:(s'=3);
+    [a]     s=1 -> 1.0:(s'=2);                 // optimal action at s-hat
+    [b]     s=1 -> 1.0:(s'=7);
+    [t2]    s=2 -> 0.9:(s'=8) + 0.1:(s'=6);
+    [x]     s=3 -> 1.0:(s'=1);                 // tie: into the cone
+    [y]     s=3 -> 1.0:(s'=4);                 // tie: outside the cone
+    [t4]    s=4 -> 0.9:(s'=8) + 0.1:(s'=6);
+    [t7]    s=7 -> 0.5:(s'=8) + 0.5:(s'=6);
+    [g]     s=8 -> 1.0:(s'=8);
+    [k]     s=6 -> 1.0:(s'=6);
+endmodule
+
+label "goal" = s=8;

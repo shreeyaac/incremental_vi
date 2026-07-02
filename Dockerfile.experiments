@@ -1,38 +1,37 @@
-# Reproducible container for the incremental-VI / cone-of-influence experiments.
+# Reproducible, self-contained container for the incremental-VI / cone-of-influence
+# experiments. Designed for a sudo-less shared server: ALL code + benchmarks live
+# inside the image; experiment OUTPUT is written only to a mounted /data volume.
 #
-# It packages the whole stack so it runs on a sudo-less server:
 #   Storm + stormpy   -> from the pinned movesrwth/stormpy:1.13.0 base image
 #   payntbind (C++)   -> compiled during the build
-#   PAYNT + our code  -> installed / copied in (incremental_vi/, run_*.py, ...)
+#   PAYNT + our code  -> copied in (incremental_vi/, run_*.py, models/, ...)
+#   PRISM benchmarks  -> cloned into the image (consensus, csma, wlan, zeroconf...)
 #
 # Base is PINNED to 1.13.0 (the version all our results were validated against);
 # do NOT use :ci, which is a rolling tag and will drift.
 #
-# Build (on the server, native x86 — fast; locally on Apple Silicon it runs
-# under emulation and is slow):
-#   docker build -f Dockerfile.experiments -t incremental-vi:1.0 .
+# Build (native x86 on the server is fast; on Apple Silicon it emulates and is slow):
+#   docker build -f Dockerfile.experiments -t hot-start-vi .
 #
-# Run an experiment (mount a host dir to get results out):
-#   docker run --rm -v "$PWD/out:/opt/paynt/out" incremental-vi:1.0 \
-#       python run_benchmarks.py --all-small \
-#         --glob "models/archive/cav23-saynt/*/sketch.templ" --num-removals 40
+# Run everything, writing results to the lab's data folder (mount it at /data):
+#   docker run --rm -v /ABS/PATH/TO/DATA:/data hot-start-vi bash run_all.sh
 #
-#   docker run --rm incremental-vi:1.0 \
-#       python coi_table.py models/archive/cav23-saynt/refuel-06 --num 8
-#
-#   docker run --rm incremental-vi:1.0 \
-#       python reproduce_eidar.py models/archive/cav23-saynt/drone-4-1 600
+# Run a single experiment:
+#   docker run --rm -v /ABS/PATH/TO/DATA:/data hot-start-vi \
+#       python run_prism_mdp.py consensus-coin2-K2
 #
 # Interactive shell:
-#   docker run --rm -it incremental-vi:1.0 bash
+#   docker run --rm -it -v /ABS/PATH/TO/DATA:/data hot-start-vi bash
 
 ARG BASE_IMAGE=movesrwth/stormpy:1.13.0
 FROM ${BASE_IMAGE}
 
-ARG no_threads=4
+ARG no_threads=16
+# parallelise the payntbind C++ compile (oileus has 96 cores)
+ENV CMAKE_BUILD_PARALLEL_LEVEL=${no_threads}
 
-# PAYNT runtime/build dependencies
-RUN apt-get update -qq && apt-get install -y graphviz && rm -rf /var/lib/apt/lists/*
+# PAYNT runtime/build dependencies + graphviz (for visualize_cone.py)
+RUN apt-get update -qq && apt-get install -y graphviz git && rm -rf /var/lib/apt/lists/*
 
 WORKDIR /opt/paynt
 COPY . .
@@ -41,6 +40,13 @@ COPY . .
 RUN pip install -r build-requirements.txt
 RUN pip install . --no-build-isolation
 
-# our experiment scripts live at the repo root and are run directly:
-#   run_experiments.py, run_benchmarks.py, coi_table.py, reproduce_eidar.py
+# PRISM benchmark suite, baked into the image so the container is self-contained
+RUN git clone --depth 1 https://github.com/prismmodelchecker/prism-benchmarks.git \
+        /opt/prism-benchmarks
+ENV PRISM_BENCHMARKS=/opt/prism-benchmarks/models/mdps
+
+# default output location -> mount the lab data folder here
+ENV OUT=/data
+VOLUME ["/data"]
+
 CMD ["bash"]

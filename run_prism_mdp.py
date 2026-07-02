@@ -22,7 +22,12 @@ from incremental_vi.model_utils import (
 )
 from incremental_vi.coi import coi_bachelor, coi_exact, coi_approx
 
-BM = "/Users/shreeya/storm-work/prism-benchmarks/models/mdps"
+# PRISM benchmark models. Override with PRISM_BENCHMARKS for the container/server;
+# defaults to the local clone for laptop runs.
+BM = os.environ.get(
+    "PRISM_BENCHMARKS",
+    "/Users/shreeya/storm-work/prism-benchmarks/models/mdps",
+)
 
 # Each entry: (model_path, prop_str, constants, target_spec)
 #   target_spec = ("labels", [(label, negate), ...])   -> AND of (maybe negated) labels
@@ -41,15 +46,47 @@ REGISTRY = {
 }
 
 
-def build_model(path, prop, consts):
+def build_model(path, prop, consts, exact=False):
     prog = stormpy.parse_prism_program(path)
     props = stormpy.parse_properties_for_prism_program(prop, prog)
     prog, props = stormpy.preprocess_symbolic_input(prog, props, consts)
     prog = prog.as_prism_program()
-    opts = stormpy.BuilderOptions([p.raw_formula for p in props])
-    opts.set_build_state_valuations()
-    model = stormpy.build_sparse_model_with_options(prog, opts)
+    if exact:
+        # exact (rational) build -> exact values -> Algorithm 1 is theoretically
+        # sound (best-action ties decided exactly, no delta-approximation).
+        model = stormpy.build_sparse_exact_model(prog, props)
+    else:
+        opts = stormpy.BuilderOptions([p.raw_formula for p in props])
+        opts.set_build_state_valuations()
+        model = stormpy.build_sparse_model_with_options(prog, opts)
     return model, props
+
+
+def exact_values_and_strategy(model, prop_obj):
+    """Exact (rational) values + optimal strategy from stormpy's exact engine."""
+    res = stormpy.model_checking(model, prop_obj, extract_scheduler=True)
+    n = model.nr_states
+    V = [res.at(s) for s in range(n)]
+    sched = res.scheduler
+    strat = {s: sched.get_choice(s).get_deterministic_choice() for s in range(n)}
+    return V, strat
+
+
+def exact_modified_values(model, prop_obj, hat_s, hat_a):
+    """Exact V_M' for the action-removed MDP via an exact submodel."""
+    n = model.nr_states
+    nci = model.nondeterministic_choice_indices
+    ks = stormpy.BitVector(n, True)
+    ka = stormpy.BitVector(model.nr_choices, True)
+    ka.set(nci[hat_s] + hat_a, False)
+    sub = stormpy.construct_submodel(model, ks, ka)
+    subm = sub.model
+    res = stormpy.model_checking(subm, prop_obj)
+    mapping = list(sub.new_to_old_state_mapping)
+    Vp = [None] * n
+    for new_s in range(subm.nr_states):
+        Vp[mapping[new_s]] = res.at(new_s)
+    return Vp, all(v is not None for v in Vp)
 
 
 def target_states(model, spec):
@@ -74,65 +111,90 @@ def n_actions(model, s):
     return m.get_row_group_end(s) - m.get_row_group_start(s)
 
 
-def run_one(name, num_removals=40):
+def run_one(name, num_removals=40, exact=True):
+    import time
     path, prop, consts, tspec = REGISTRY[name]
-    model, props = build_model(path, prop, consts)
+    model, props = build_model(path, prop, consts, exact=exact)
     n = model.nr_states
-    env = tight_environment()
     T = target_states(model, tspec)
     back = compute_backward_transitions(model)
-    V, strat = compute_values_and_strategy(model, props[0], env=env)
+    if exact:
+        V, strat = exact_values_and_strategy(model, props[0])
+        tol = 0          # exact ties -> Algorithm 1 sound
+        zero = 0
+    else:
+        env = tight_environment()
+        V, strat = compute_values_and_strategy(model, props[0], env=env)
+        tol = None       # default float tolerance
+        zero = 1e-9
     mm = compute_mec_map(model)
 
     cands = [s for s in range(n) if n_actions(model, s) >= 2
-             and s not in T and V[s] > 1e-9]
+             and s not in T and V[s] > zero]
 
     sizes = {"bachelor": [], "exact": [], "approx": []}
     missed = {"bachelor": 0, "exact": 0, "approx": 0}
+    times = {"bachelor": [], "exact": [], "approx": []}
     n_eff = 0
     for hs in cands:
         if n_eff >= num_removals:
             break
         ha = strat[hs]
-        Vp, ok = build_modified_values(model, props[0], hs, ha, env=env)
+        if exact:
+            Vp, ok = exact_modified_values(model, props[0], hs, ha)
+        else:
+            Vp, ok = build_modified_values(model, props[0], hs, ha, env=env)
         if not ok:
             continue
-        truly = {s for s in range(n) if abs(V[s] - Vp[s]) > 1e-7}
+        # exact: V[s] != Vp[s] is decided exactly; float: use a threshold
+        if exact:
+            truly = {s for s in range(n) if V[s] != Vp[s]}
+        else:
+            truly = {s for s in range(n) if abs(V[s] - Vp[s]) > 1e-7}
         if not truly:
             continue
         n_eff += 1
-        cones = {
-            "bachelor": coi_bachelor(model, hs, ha, V, strat, back),
-            "exact": coi_exact(model, hs, ha, V, back, T, mec_map=mm),
-            "approx": coi_approx(model, hs, ha, V, back, T, mec_map=mm),
-        }
-        for m_, c in cones.items():
+        for m_, fn, kw in [
+            ("bachelor", coi_bachelor, dict(strategy=strat, backward_trans=back)),
+            ("exact", coi_exact, dict(backward_trans=back, target_states=T,
+                                      mec_map=mm, tol=tol)),
+            ("approx", coi_approx, dict(backward_trans=back, target_states=T,
+                                        mec_map=mm, tol=tol)),
+        ]:
+            t0 = time.perf_counter()
+            c = fn(model, hs, ha, V, **kw)
+            times[m_].append(time.perf_counter() - t0)
             sizes[m_].append(100.0 * len(c) / n)
             missed[m_] += len(truly - c)
 
-    return {"name": name, "states": n, "targets": len(T),
-            "n_eff": n_eff, "sizes": sizes, "missed": missed}
+    return {"name": name, "states": n, "targets": len(T), "exact": exact,
+            "n_eff": n_eff, "sizes": sizes, "missed": missed, "times": times}
 
 
 def print_result(r):
+    vmode = "EXACT (rational)" if r.get("exact") else "sound VI 1e-10"
     print(f"\n### {r['name']}  ({r['states']} states, {r['targets']} target, "
-          f"{r['n_eff']} effective removals)")
+          f"{r['n_eff']} effective removals)  values={vmode}")
     if r["n_eff"] == 0:
         print("  (no value-changing removals)")
         return
-    print(f"  {'method':<10}{'mean %':>9}{'median %':>10}{'max %':>9}{'missed':>9}")
-    print(f"  {'-'*46}")
+    print(f"  {'method':<10}{'mean %':>9}{'median %':>10}{'max %':>9}"
+          f"{'missed':>8}{'mean ms':>10}{'max ms':>9}")
+    print(f"  {'-'*65}")
     for m in ["bachelor", "exact", "approx"]:
         s = r["sizes"][m]
+        t = [x * 1000 for x in r["times"][m]]  # ms
         print(f"  {m:<10}{statistics.mean(s):>9.2f}{statistics.median(s):>10.2f}"
-              f"{max(s):>9.2f}{r['missed'][m]:>9}")
+              f"{max(s):>9.2f}{r['missed'][m]:>8}"
+              f"{statistics.mean(t):>10.2f}{max(t):>9.2f}")
 
 
 if __name__ == "__main__":
     num = int(os.environ.get("NUM", "40"))
+    exact = os.environ.get("EXACT", "1") != "0"
     names = sys.argv[1:] if len(sys.argv) > 1 else list(REGISTRY)
     for nm in names:
         try:
-            print_result(run_one(nm, num_removals=num))
+            print_result(run_one(nm, num_removals=num, exact=exact))
         except Exception as e:
             print(f"\n### {nm}: ERROR {type(e).__name__}: {e}")
